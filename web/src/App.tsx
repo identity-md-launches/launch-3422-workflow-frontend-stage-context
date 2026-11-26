@@ -29,12 +29,15 @@ type RunOpts = {
   afterFail?: (errorName: string | undefined, mined: boolean) => Promise<string | undefined>;
 };
 
+type SetTx = (u: Tx | ((t: Tx) => Tx)) => void;
+type RunParams = Parameters<typeof simulateContract>[1];
+const IDLE: Tx = { phase: "idle" };
+const isBusy = (t: Tx) => t.phase === "simulating" || t.phase === "wallet" || t.phase === "pending";
+
 /** Simulate, send, wait for the receipt, and report what the receipt shows. Never reports the simulation's result. */
-function useTx(d: Deployment) {
+function useRunner(d: Deployment) {
   const config = useConfig();
   const qc = useQueryClient();
-  const [tx, setTx] = useState<Tx>({ phase: "idle" });
-  const busy = tx.phase === "simulating" || tx.phase === "wallet" || tx.phase === "pending";
   const refresh = () => void qc.invalidateQueries().catch(() => undefined);
   async function override(opts: RunOpts | undefined, name: string | undefined, mined: boolean) {
     try {
@@ -43,7 +46,7 @@ function useTx(d: Deployment) {
       return undefined;
     }
   }
-  async function run(label: string, params: Parameters<typeof simulateContract>[1], describe: (r: TransactionReceipt) => Outcome, opts?: RunOpts) {
+  return async function run(setTx: SetTx, label: string, params: RunParams, describe: (r: TransactionReceipt) => Outcome, opts?: RunOpts) {
     let hash: Hex | undefined;
     try {
       setTx({ phase: "simulating", label });
@@ -88,13 +91,33 @@ function useTx(d: Deployment) {
       const msg = (await override(opts, ex.name, false)) ?? ex.text;
       setTx({ phase: "failed", hash, message: msg });
     }
-  }
+  };
+}
+
+/** One transaction slot owned by a component. */
+function useTx(d: Deployment) {
+  const runner = useRunner(d);
+  const [tx, setTx] = useState<Tx>(IDLE);
   return {
     tx,
-    busy,
-    run,
+    busy: isBusy(tx),
+    run: (label: string, params: RunParams, describe: (r: TransactionReceipt) => Outcome, opts?: RunOpts) => runner(setTx, label, params, describe, opts),
     /** Clears finished feedback only. A request in flight keeps its status, link and busy flag. */
-    resetTerminal: () => setTx((t) => (t.phase === "done" || t.phase === "failed" ? { phase: "idle" } : t)),
+    resetTerminal: () => setTx((t) => (t.phase === "done" || t.phase === "failed" ? IDLE : t)),
+  };
+}
+
+/** Transaction slots keyed by id (gift claims), held by the list so a result outlives its row being filtered out. */
+function useTxMap(d: Deployment) {
+  const runner = useRunner(d);
+  const [map, setMap] = useState<Record<string, Tx>>({});
+  const get = (id: string) => map[id] ?? IDLE;
+  return {
+    map,
+    get,
+    busy: (id: string) => isBusy(get(id)),
+    run: (id: string, label: string, params: RunParams, describe: (r: TransactionReceipt) => Outcome, opts?: RunOpts) =>
+      runner((u) => setMap((m) => ({ ...m, [id]: typeof u === "function" ? u(m[id] ?? IDLE) : u })), label, params, describe, opts),
   };
 }
 
@@ -165,6 +188,7 @@ export function App({ d }: { d: Deployment }) {
   const wrongChain = isConnected && chainId !== d.chain.id;
   const a = reads.acct.data;
   const s = reads.summary.data;
+  const acctFailed = isConnected && reads.acct.isError;
   const onTabKey = (e: KeyboardEvent<HTMLDivElement>) => {
     if (e.key !== "ArrowLeft" && e.key !== "ArrowRight" && e.key !== "Home" && e.key !== "End") return;
     e.preventDefault();
@@ -196,17 +220,29 @@ export function App({ d }: { d: Deployment }) {
         <dl className="stats" aria-label="Live contract state">
           <div>
             <dt>Your balance</dt>
-            <dd>{isConnected ? `${fmt(a?.balance)} testAdam` : "Connect to see"}</dd>
+            <dd>{!isConnected ? "Connect to see" : a ? `${fmt(a.balance)} testAdam` : acctFailed ? <span className="stat-off">Unavailable</span> : "…"}</dd>
           </div>
           <div>
             <dt>Your points</dt>
-            <dd>{isConnected ? fmt(a?.points) : "Connect to see"}</dd>
+            <dd>{!isConnected ? "Connect to see" : a ? fmt(a.points) : acctFailed ? <span className="stat-off">Unavailable</span> : "…"}</dd>
           </div>
           <div>
             <dt>Unclaimed gifts</dt>
             <dd>{s ? `${fmt(s.totalOutstanding)} testAdam` : reads.summary.isError ? "Unavailable" : "…"}</dd>
           </div>
         </dl>
+        {acctFailed && (
+          <div className="retry" role="alert">
+            <p className="note note-error">
+              {a
+                ? `Wallet details didn't refresh. Balance and points shown were last checked at ${new Date(reads.acct.dataUpdatedAt).toISOString().slice(11, 19)} UTC.`
+                : "Your wallet's balance and points couldn't be read from the network."}
+            </p>
+            <button className="btn btn-secondary btn-sm" onClick={() => reads.acct.refetch()} disabled={reads.acct.isFetching}>
+              {reads.acct.isFetching ? "Retrying…" : "Retry wallet details"}
+            </button>
+          </div>
+        )}
 
         <section className="card action" aria-label="Donate or buy">
           <div className="tabs" role="tablist" aria-label="Action" onKeyDown={onTabKey}>
@@ -343,12 +379,14 @@ function Donate({ d, reads, wrongChain, openConnect, active = true }: PanelProps
           <span className="unit" aria-hidden="true">testAdam</span>
         </span>
       </div>
-      <p id="donate-help" className={`hint ${invalid || short_ ? "hint-error" : ""}`}>
+      <p id="donate-help" className={`hint ${invalid || short_ || (isConnected && !a && reads.acct.isError) ? "hint-error" : ""}`}>
         {invalid
           ? `Enter a positive amount with at most 18 decimals, like ${example("1.5")}.`
           : short_
             ? `You have ${fmt(a!.balance)} testAdam. Enter that much or less.`
-            : "Only Donate creates a gift. You earn one nontransferable point per testAdam the vault receives, including fractions, and keep those points after payout."}
+            : isConnected && !a && reads.acct.isError
+              ? "Approve stays off until your balance can be read. Choose Retry wallet details above."
+              : "Only Donate creates a gift. You earn one nontransferable point per testAdam the vault receives, including fractions, and keep those points after payout."}
       </p>
       {!isConnected ? (
         <button className="btn btn-primary btn-wide" onClick={openConnect}>
@@ -614,6 +652,35 @@ function Gifts({ d, reads, wrongChain, openConnect }: PanelProps) {
   });
   const list = useMemo(() => (gifts.data ?? []).filter((g) => !openOnly || !g.claimed), [gifts.data, openOnly]);
   const openCount = (gifts.data ?? []).filter((g) => !g.claimed).length;
+  // Claim results live here, keyed by gift id, so Open only hiding a row that just became claimed keeps its receipt and link.
+  const claims = useTxMap(d);
+  const shownIds = new Set(list.map((g) => g.id.toString()));
+  const hiddenResults = Object.entries(claims.map).filter(([id, t]) => t.phase !== "idle" && !shownIds.has(id));
+  const claim = (g: Gift) => {
+    const claimer = address!;
+    claims.run(
+      g.id.toString(),
+      "the claim",
+      { address: d.vault.address, abi: d.vault.abi, functionName: "claim", args: [g.id], account: claimer } as never,
+      (r) => {
+        const ev = parseEventLogs({ abi: d.vault.abi as Abi, logs: r.logs, eventName: "Claimed" })[0] as unknown as { args: { amount: bigint } } | undefined;
+        return {
+          message: ev ? `You received ${fmt(ev.args.amount)} testAdam from gift #${g.id}.` : `Confirmed in block ${r.blockNumber}, but it paid out nothing.`,
+          detail: async () => {
+            const bal = (await reads.client.readContract({ address: d.token.address, abi: d.token.abi as Abi, functionName: "balanceOf", args: [claimer], blockNumber: r.blockNumber })) as bigint;
+            return `Balance now ${fmt(bal)} testAdam.`;
+          },
+        };
+      },
+      {
+        // A failed preflight or a mined revert: reread this gift. If it is claimed now, another wallet won it.
+        afterFail: async () => {
+          const [, , claimed] = (await reads.client.readContract({ address: d.vault.address, abi: d.vault.abi as Abi, functionName: "getGift", args: [g.id] })) as [Address, bigint, boolean];
+          return claimed ? `Another wallet claimed gift #${g.id} first.` : undefined;
+        },
+      },
+    );
+  };
 
   return (
     <section className="card" aria-labelledby="gifts-title">
@@ -655,10 +722,36 @@ function Gifts({ d, reads, wrongChain, openConnect }: PanelProps) {
               </button>
             </div>
           )}
+          {hiddenResults.length > 0 && (
+            <div className="claim-results" role="group" aria-labelledby="claim-results-title">
+              <p id="claim-results-title" className="hint">
+                Your claims hidden by Open only
+              </p>
+              {hiddenResults.map(([id, t]) => (
+                <div key={id} className="claim-result">
+                  <span className="gift-id">#{id}</span>
+                  <TxStatus tx={t} d={d} />
+                </div>
+              ))}
+            </div>
+          )}
           <ul className="gifts">
-            {list.map((g) => (
-              <GiftRow key={g.id.toString()} g={g} d={d} me={address} canSend={isConnected && !wrongChain} openConnect={openConnect} isConnected={isConnected} reads={reads} />
-            ))}
+            {list.map((g) => {
+              const id = g.id.toString();
+              return (
+                <GiftRow
+                  key={id}
+                  g={g}
+                  d={d}
+                  me={address}
+                  canSend={isConnected && !wrongChain}
+                  openConnect={openConnect}
+                  isConnected={isConnected}
+                  tx={claims.get(id)}
+                  onClaim={() => claim(g)}
+                />
+              );
+            })}
             {list.length === 0 && <li className="empty">No open gifts among those shown.</li>}
           </ul>
         </>
@@ -672,33 +765,9 @@ function Gifts({ d, reads, wrongChain, openConnect }: PanelProps) {
   );
 }
 
-function GiftRow({ g, d, me, canSend, isConnected, openConnect, reads }: { g: Gift; d: Deployment; me?: Address; canSend: boolean; isConnected: boolean; openConnect: () => void; reads: Reads }) {
-  const claimTx = useTx(d);
+function GiftRow({ g, d, me, canSend, isConnected, openConnect, tx, onClaim }: { g: Gift; d: Deployment; me?: Address; canSend: boolean; isConnected: boolean; openConnect: () => void; tx: Tx; onClaim: () => void }) {
   const mine = !!me && me.toLowerCase() === g.donor.toLowerCase();
-  const claim = () => {
-    const claimer = me!;
-    claimTx.run(
-      "the claim",
-      { address: d.vault.address, abi: d.vault.abi, functionName: "claim", args: [g.id], account: claimer } as never,
-      (r) => {
-        const ev = parseEventLogs({ abi: d.vault.abi as Abi, logs: r.logs, eventName: "Claimed" })[0] as unknown as { args: { amount: bigint } } | undefined;
-        return {
-          message: ev ? `You received ${fmt(ev.args.amount)} testAdam from gift #${g.id}.` : `Confirmed in block ${r.blockNumber}, but it paid out nothing.`,
-          detail: async () => {
-            const bal = (await reads.client.readContract({ address: d.token.address, abi: d.token.abi as Abi, functionName: "balanceOf", args: [claimer], blockNumber: r.blockNumber })) as bigint;
-            return `Balance now ${fmt(bal)} testAdam.`;
-          },
-        };
-      },
-      {
-        // A failed preflight or a mined revert: reread this gift. If it is claimed now, another wallet won it.
-        afterFail: async () => {
-          const [, , claimed] = (await reads.client.readContract({ address: d.vault.address, abi: d.vault.abi as Abi, functionName: "getGift", args: [g.id] })) as [Address, bigint, boolean];
-          return claimed ? "Another wallet claimed this gift first." : undefined;
-        },
-      },
-    );
-  };
+  const busy = isBusy(tx);
   return (
     <li className="gift">
       <div className="gift-main">
@@ -721,12 +790,12 @@ function GiftRow({ g, d, me, canSend, isConnected, openConnect, reads }: { g: Gi
             Connect to claim
           </button>
         ) : (
-          <button className="btn btn-primary btn-sm" disabled={!canSend || claimTx.busy} onClick={claim}>
-            {claimTx.busy ? "Claiming…" : `Claim #${g.id}`}
+          <button className="btn btn-primary btn-sm" disabled={!canSend || busy} onClick={onClaim}>
+            {busy ? "Claiming…" : `Claim #${g.id}`}
           </button>
         )}
       </div>
-      {claimTx.tx.phase !== "idle" && <TxStatus tx={claimTx.tx} d={d} />}
+      {tx.phase !== "idle" && <TxStatus tx={tx} d={d} />}
     </li>
   );
 }
@@ -744,7 +813,7 @@ function PoolPanel({ d }: { d: Deployment }) {
       {pool.isError ? (
         <p className="note note-error">Pool data did not load: {explainError(pool.error).text}. It retries every two minutes.</p>
       ) : !p ? (
-        <p className="hint">Reading the finalized block and scanning 24 hours of swaps…</p>
+        <p className="hint">Loading pool data…</p>
       ) : (
         <dl className="kv">
           <div>

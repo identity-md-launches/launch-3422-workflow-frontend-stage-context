@@ -27,8 +27,29 @@ Worker report for the frontend stage. It is not an independent certification. Ev
 | --- | --- |
 | `npm run typecheck` (`tsc -b --noEmit`) | passed, no errors |
 | `npm test` (vitest, `src/logic.test.ts`) | 9/9 passed: amount parsing and formatting, including locale cases (fr-FR "1,5" → 1.5, "0,01" → 0.01, "1 000,5" → 1000.5, "1,5,5" rejected; en-US "1,5" and "0,01" rejected rather than read as 15 and 1; de-DE "1.000,5" → 1000.5 and "0.01" rejected) and round-tripping the balance shortcut, pool id equal to the on-chain id, sqrtPriceX96 conversion in both currency orders, distinct-swap ETH-leg sum, slippage rounding, full decode of the `execute` payload (commands `0x10`, actions `0x060c0f`, 5-field ExactInputSingleParams with the handoff key, SETTLE_ALL and TAKE_ALL params) |
-| `npm run build` | vite build to `../dist`, then manifest: 2 contracts, 11 assets, 1,417,049 bytes total (largest file 578 KB) |
+| `npm run build` | vite build to `../dist`, then manifest: 2 contracts, 11 assets, 1,418,859 bytes total (largest file 579 KB) |
 | `npm run verify` | `ok: true`. It checks the key set; that launchId, chainId, sourceCommit, attestationHash, poolKey and contracts equal the handoff; that network and walletAddChain equal `network.json` byte for byte; ABI hashes; that every file is listed with the right SHA-256; relative paths; and that index.html has no root-absolute asset URLs |
+
+## Revision round 3: claim results under Open only, failed wallet reads (Chromium, mocked RPC and wallet)
+
+Script: `test/scratch/e2e.mjs` (not submitted; rewritten this round because the earlier scratch copy was deleted). It uses the same method as the round below. The built `dist/` export is served from `http://site.test/preview/`. A JSON-RPC mock in the script answers every request to the manifest's three RPC URLs, decoding `eth_call` against the exported ABIs. A mock EIP-6963 "Test Wallet" returns transaction hashes whose receipts the test holds and then releases. Chromium is Playwright's headless shell, with system libraries and DejaVu fonts unpacked from Ubuntu packages into the scratch directory. **Final run on the final export: 34/34 passed, no console errors, no requests outside the site and the mocked RPCs.**
+
+**Finding 662e… (high): Open only discarded the claim receipt and its link. Reproduced, fixed.**
+
+- Reproduction: the same script was run against the previous export (HEAD's `dist/`). With Open only checked, Claim #1, then the receipt released with status 0x1 and `Claimed(1, wallet, 1.5e18)` and `getGift(1)` claimed. "You received 1.5 testAdam from gift #1." never appeared (20 s timeout). The row was unmounted by the filter on refresh, and its transaction state went with it.
+- Cause: each `GiftRow` owned its own `useTx` state, so a row filtered out lost its status.
+- Fix: claim transactions are held by the Gifts panel in a map keyed by gift id (`useTxMap`, `web/src/App.tsx:111`, used at `:656`). The shared simulate, send and receipt logic moved into `useRunner` (`web/src/App.tsx:38`) unchanged, and `useTx` wraps it for the other panels. `GiftRow` is presentational (`web/src/App.tsx:768`). When Open only hides a row that has a status, the id and its status note stay above the list under the caption "Your claims hidden by Open only" (`web/src/App.tsx:726`). Unchecking the filter puts the note back in its row.
+- Checked after the fix: with Open only on, the confirmation "You received 1.5 testAdam from gift #1. Balance now 6.5 testAdam." and exactly one "View transaction" link (to that hash) stay visible while row #1 is hidden. After unchecking, row #1 shows Claimed with the same note and link, once. Race: Claim #2, then another wallet claims it and the receipt comes back with status 0x0. "Another wallet claimed gift #2 first." and its receipt link show with Open only on (beside the earlier #1 result, with "No open gifts among those shown." in the list), and in row #2 after unchecking. No horizontal scroll at 390 or 320 with hidden results showing.
+
+**Finding 4fc6… (medium): a failed wallet balance read looked like it was still loading. Reproduced (code), fixed.**
+
+- Reproduction: in the previous source the stats rendered `fmt(a?.balance)` with no error branch, so a failed account query showed "…" indefinitely. The donation hint gave no reason for the disabled Approve.
+- Fix (`web/src/App.tsx:191`, `:223`, `:227`, `:242`, `:388`): when the account query has failed, Your balance and Your points read "Unavailable" (`.stat-off`, `web/src/styles.css:203`). An alert row below the stats offers "Retry wallet details". Without earlier data it says "Your wallet's balance and points couldn't be read from the network." After an earlier good read it keeps the values and says "Wallet details didn't refresh. Balance and points shown were last checked at HH:MM:SS UTC." The donation hint says "Approve stays off until your balance can be read. Choose Retry wallet details above."
+- Checked after the fix: `balanceOf(wallet)` errors on all three RPCs (24 failed calls by the time of the check), while the other reads succeed. Both stats read "Unavailable" on one line at 390 and 320 (the first version broke the word as "Unavailab/le" at 390; it now uses the 13px regular muted style). The error and Retry are shown. With 1.5 entered, Approve is disabled and the hint explains why. Retry after the RPC recovers shows "5 testAdam", removes the retry row and enables Approve. Failing again on the next 20 s refresh keeps "5 testAdam" with the last-checked message and Retry.
+
+Also this round: the design probe failed `copy-budget` at 1440 (91 prose words against a bar of 90) while the Pool panel was still loading. Its loading line was shortened to "Loading pool data…" (`web/src/App.tsx:816`), and the probe then passed 16/16.
+
+Not run this round: WebKit (same missing system libraries as below), and the anvil fork. Both findings were checked only against the mocked RPC.
 
 ## Revision round: reviewer findings reproduced and rechecked (Chromium, mocked RPC and wallet)
 
@@ -71,7 +92,7 @@ An earlier run found that the Coinbase Wallet SDK sent a telemetry request to `c
 
 ## Design review probe (taste@1)
 
-`node .imd/reads/skills/design-critic/scripts/taste.mjs --out test/scratch/taste` (Playwright from `~/.imd-taste` in the previous round; this round from `test/scratch/pw` via `IMD_PLAYWRIGHT`). **Final, rerun on this round's export: 16/16** (render, layout, targets, contrast, casing, tracking, eyebrows, type-sizes, type-faces, glyphs, slogans, repetition, copy-budget, chrome, motion, share). Earlier runs failed `layout` at 320 (8px overflow), `eyebrows` (the Connect button within 40px above the h1) and `copy-budget` (63 words at 390, 105 at 1440); all three were fixed, see below. The 390 screenshot was viewed: header with Connect, the headline pair, three live stats, and the Donate/Buy card with amount field, the one-line points rule and the main button are all on the first screen.
+`node .imd/reads/skills/design-critic/scripts/taste.mjs --out test/scratch/taste` (Playwright from `~/.imd-taste` in the previous round; this round from `test/scratch/pw` via `IMD_PLAYWRIGHT`). **Final, rerun on revision round 3's export: 16/16** (render, layout, targets, contrast, casing, tracking, eyebrows, type-sizes, type-faces, glyphs, slogans, repetition, copy-budget, chrome, motion, share). Earlier runs failed `layout` at 320 (8px overflow), `eyebrows` (the Connect button within 40px above the h1) and `copy-budget` (63 words at 390, 105 at 1440); all three were fixed, see below. The 390 screenshot was viewed: header with Connect, the headline pair, three live stats, and the Donate/Buy card with amount field, the one-line points rule and the main button are all on the first screen.
 
 ## Better Interface review
 
@@ -110,6 +131,13 @@ Revision-round findings and fixes (each rechecked in the mocked-RPC run above):
 17. **MEDIUM, behavior:** EIP-6963 wallets are listed on phones (`web/src/wallet.tsx:173`).
 18. **MEDIUM, accessibility:** tabs use a roving tabindex and arrow keys (`web/src/App.tsx:168`).
 19. **MEDIUM, writing:** quote errors are classified (`web/src/wallet.tsx:72`). A zero quote, missing liquidity and a provider failure each get their own next step (`web/src/App.tsx:547`).
+
+Revision round 3 findings and fixes (rechecked in the mocked-RPC run above):
+
+20. **HIGH, behavior:** claim results are kept per gift id in the Gifts panel, so Open only no longer discards a receipt or its link (`web/src/App.tsx:111`, `:656`, `:726`).
+21. **MEDIUM, writing/behavior:** failed account reads show "Unavailable", "Retry wallet details" and a last-checked time for stale values, and the Approve hint explains why it is off (`web/src/App.tsx:223`, `:242`, `:388`).
+22. **LOW, typography:** "Unavailable" broke mid-word in the 390 stats row. It uses the small muted style without `overflow-wrap: anywhere` (`web/src/styles.css:203`).
+23. **LOW, writing/probe `copy-budget`:** shorter Pool loading line (`web/src/App.tsx:816`).
 
 Remaining limitations: the README disclosures sit in a "Before you donate" `<details>`. The essential rule ("Only Donate creates a gift and earns points…") is always visible beside the form, but the full disclosure text needs one tap. The stats show "Connect to see" on two lines at 390. The share image path is relative (`./og.png`) because the hosted URL is not known yet.
 

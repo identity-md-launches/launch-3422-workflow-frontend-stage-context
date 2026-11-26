@@ -199,6 +199,13 @@ a {
   font-variant-numeric: tabular-nums;
   overflow-wrap: anywhere;
 }
+/* A missing value reads quieter than data and stays one word in the narrow three-column row. */
+.stats .stat-off {
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-regular);
+  color: var(--muted);
+  overflow-wrap: normal;
+}
 .card {
   background: var(--surface);
   border: 1px solid var(--border);
@@ -498,6 +505,21 @@ select {
 }
 .gift .note {
   flex-basis: 100%;
+}
+.claim-results {
+  display: grid;
+  gap: var(--space-2);
+}
+.claim-result {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-1) var(--space-3);
+  min-width: 0;
+}
+.claim-result .note {
+  flex: 1 1 12rem;
+  min-width: 0;
 }
 .gift-main {
   display: flex;
