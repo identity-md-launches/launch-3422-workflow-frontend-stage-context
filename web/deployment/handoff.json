@@ -1,0 +1,58 @@
+{
+  "chainId": 11155111,
+  "poolKey": {
+    "fee": 12500,
+    "hooks": "0xa0602cb30558d5dd17415b6268a4feea3a0ca000",
+    "currency0": "0x0000000000000000000000000000000000000000",
+    "currency1": "0x4cc136b358c28cd7107b22a8ef853b077a0b8ec9",
+    "tickSpacing": 60
+  },
+  "repoUrl": "https://github.com/identity-md-launches/launch-3417-workflow-contract-stage-context",
+  "version": 1,
+  "launchId": "2896cd7a-8746-400d-9809-5e342463e993",
+  "manifest": {
+    "kind": "evm_project",
+    "pool": {
+      "fee": 12500,
+      "tickSpacing": 60,
+      "initialPrice": "79228162514264337593543950336",
+      "pairedCurrency": "0x0000000000000000000000000000000000000000"
+    },
+    "notes": "DonationVault binds LaunchToken at construction. Neither contract has an owner or admin, and no initialization calls are needed. Users approve then donate to create public gifts; the first wallet other than the donor to claim receives the full gift. Donor points include fractions and persist after payout. Points measure gross donations and can be farmed with a second wallet; they do not prove net giving. Direct token transfers to the vault create no gift or points and remain locked. The factory supplies the native ETH/testAdam pool, MerkleDistributor and initialization-only pool guard.",
+    "token": {
+      "name": "test",
+      "symbol": "testAdam",
+      "contract": "LaunchToken",
+      "decimals": 18
+    },
+    "contracts": [
+      {
+        "contract": "DonationVault",
+        "constructorArgs": [
+          "$token"
+        ]
+      }
+    ]
+  },
+  "contracts": [
+    {
+      "name": "LaunchToken",
+      "txHash": "0x72562a80dff94d6c0c19aeadb1099c66ad3bc708bd3906422453bd273743d234",
+      "abiHash": "2f13039a1bab8f19e70a4f4048e5ba9153021dc58691e7dbb01d77a724b30177",
+      "address": "0x4cc136b358c28cd7107b22a8ef853b077a0b8ec9",
+      "blockNumber": 12212785,
+      "creationCodeHash": "7a59ef05b61164a9c16aad03f4b184960325dfd0bcc02c339455b3be4ef9755c"
+    },
+    {
+      "name": "DonationVault",
+      "txHash": "0x72562a80dff94d6c0c19aeadb1099c66ad3bc708bd3906422453bd273743d234",
+      "abiHash": "1f918199abd62d07bc7d559cd53330b26b35764a6ebe717745222bd61cfdd7b7",
+      "address": "0xa241f03c041f964b37f63b874e81ac810a9739e3",
+      "blockNumber": 12212785,
+      "creationCodeHash": "35e1732dc006621e77677f44f24cc2777501b1a29bab0055c4bb455667632e21"
+    }
+  ],
+  "sourceCommit": "29cf2d87ebd12eba43c683766eb2fae4cd5e2811",
+  "abiInstructions": "Build ABIs from this exact source commit; compare canonicalKeccak(abi) with abiHash. Verify deployed code on the stated chain before enabling transactions.",
+  "attestationHash": "02acb510b5a4e7208185ca7efa77fb7b6013a8e903332eedcf427b21fed3eeaf"
+}
