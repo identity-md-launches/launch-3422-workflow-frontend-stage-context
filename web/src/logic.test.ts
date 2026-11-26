@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { decodeAbiParameters, decodeFunctionData, encodeFunctionData, parseEther } from "viem";
 import handoff from "../deployment/handoff.json";
 import { encodeExactInSingle, minOut, poolIdOf, priceFromSqrt, universalRouterAbi } from "./uniswap";
-import { fmt, parseAmount } from "./format";
+import { example, fmt, fmtInput, parseAmount } from "./format";
 import { sumEthLeg } from "./pool";
 import type { PoolKey } from "./deployment";
 
@@ -14,12 +14,41 @@ describe("amounts", () => {
     expect(parseAmount("0")).toBeUndefined();
     expect(parseAmount("abc")).toBeUndefined();
     expect(parseAmount("1." + "1".repeat(19))).toBeUndefined();
-    expect(parseAmount("1,000")).toBe(parseEther("1000"));
+    expect(parseAmount("1,000", 18, "en-US")).toBe(parseEther("1000"));
+  });
+  it("reads decimal commas in the visitor's locale and never multiplies them away", () => {
+    // fr-FR: decimal comma, (narrow) no-break space grouping
+    expect(parseAmount("1,5", 18, "fr-FR")).toBe(parseEther("1.5"));
+    expect(parseAmount("0,01", 18, "fr-FR")).toBe(parseEther("0.01"));
+    expect(parseAmount("0.01", 18, "fr-FR")).toBe(parseEther("0.01"));
+    expect(parseAmount("1 000,5", 18, "fr-FR")).toBe(parseEther("1000.5"));
+    expect(parseAmount("1\u202f000,5", 18, "fr-FR")).toBe(parseEther("1000.5"));
+    expect(parseAmount("1,5,5", 18, "fr-FR")).toBeUndefined();
+    expect(parseAmount("1 5", 18, "fr-FR")).toBeUndefined();
+    expect(parseAmount("1,5.2", 18, "fr-FR")).toBeUndefined();
+    // en-US: "1,5" is not valid grouping, so it is rejected instead of becoming 15
+    expect(parseAmount("1,5", 18, "en-US")).toBeUndefined();
+    expect(parseAmount("0,01", 18, "en-US")).toBeUndefined();
+    expect(parseAmount("1,000.5", 18, "en-US")).toBe(parseEther("1000.5"));
+    expect(parseAmount("1,0000", 18, "en-US")).toBeUndefined();
+    expect(parseAmount(".5", 18, "en-US")).toBe(parseEther("0.5"));
+    // de-DE: "." groups, "," is decimal
+    expect(parseAmount("1,5", 18, "de-DE")).toBe(parseEther("1.5"));
+    expect(parseAmount("1.000,5", 18, "de-DE")).toBe(parseEther("1000.5"));
+    expect(parseAmount("0.01", 18, "de-DE")).toBeUndefined();
+  });
+  it("writes the placeholder, example and balance shortcut in the same locale", () => {
+    expect(example("1.5", "fr-FR")).toBe("1,5");
+    expect(example("1.5", "en-US")).toBe("1.5");
+    expect(fmtInput(parseEther("1234.5"), 18, "fr-FR")).toBe("1234,5");
+    expect(parseAmount(fmtInput(1_234_567_890_123_456_789n, 18, "fr-FR"), 18, "fr-FR")).toBe(1_234_567_890_123_456_789n);
+    expect(fmt(parseEther("1.5"), 18, 4, "fr-FR")).toBe("1,5");
+    expect(fmt(parseEther("1000000"), 18, 4, "de-DE")).toBe("1.000.000");
   });
   it("formats without overstating", () => {
-    expect(fmt(1_999_999_999_999_999_999n)).toBe("1.9999");
-    expect(fmt(10n ** 27n)).toBe("1,000,000,000");
-    expect(fmt(1n)).toBe("< 0.0001");
+    expect(fmt(1_999_999_999_999_999_999n, 18, 4, "en-US")).toBe("1.9999");
+    expect(fmt(10n ** 27n, 18, 4, "en-US")).toBe("1,000,000,000");
+    expect(fmt(1n, 18, 4, "en-US")).toBe("< 0.0001");
   });
 });
 

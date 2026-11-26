@@ -1,16 +1,17 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type KeyboardEvent } from "react";
 import { useAccount, useConfig, usePublicClient } from "wagmi";
-import { simulateContract, waitForTransactionReceipt, writeContract } from "wagmi/actions";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { getPublicClient, simulateContract, writeContract } from "wagmi/actions";
+import { keepPreviousData, useQuery, useQueryClient } from "@tanstack/react-query";
 import { parseEventLogs, type Abi, type Address, type Hex, type TransactionReceipt } from "viem";
 import type { Deployment } from "./deployment";
-import { ConnectControl, explainError, switchToChain } from "./wallet";
-import { fmt, parseAmount, short, utc } from "./format";
+import { ConnectControl, explainError, isLiquidityError, switchToChain } from "./wallet";
+import { example, fmt, fmtInput, parseAmount, short, utc } from "./format";
 import { encodeExactInSingle, minOut, quoterAbi, universalRouterAbi } from "./uniswap";
 import { loadPool } from "./pool";
 
 const ZERO = "0x0000000000000000000000000000000000000000";
 const QUOTE_TTL_MS = 30_000;
+const BALANCE_UNAVAILABLE = "Balance unavailable. Refresh to try again.";
 
 type Tx =
   | { phase: "idle" }
@@ -19,40 +20,82 @@ type Tx =
   | { phase: "done"; hash: Hex; message: string }
   | { phase: "failed"; message: string; hash?: Hex };
 
+/** What a confirmed receipt shows right away, plus an optional follow-up read that may fail on its own. */
+type Outcome = { message: string; detail?: () => Promise<string>; detailFailed?: string };
+type RunOpts = {
+  /** Checked after the simulation and before the wallet opens. A returned message stops the request. */
+  guard?: () => string | undefined;
+  /** After a failed simulation or a mined revert: reread state and return a message that replaces the generic one. */
+  afterFail?: (errorName: string | undefined, mined: boolean) => Promise<string | undefined>;
+};
+
 /** Simulate, send, wait for the receipt, and report what the receipt shows. Never reports the simulation's result. */
 function useTx(d: Deployment) {
   const config = useConfig();
   const qc = useQueryClient();
   const [tx, setTx] = useState<Tx>({ phase: "idle" });
   const busy = tx.phase === "simulating" || tx.phase === "wallet" || tx.phase === "pending";
-  async function run(
-    label: string,
-    params: Parameters<typeof simulateContract>[1],
-    describe: (r: TransactionReceipt) => Promise<string> | string,
-    onRevertName?: (name: string | undefined) => void,
-  ) {
+  const refresh = () => void qc.invalidateQueries().catch(() => undefined);
+  async function override(opts: RunOpts | undefined, name: string | undefined, mined: boolean) {
+    try {
+      return await opts?.afterFail?.(name, mined);
+    } catch {
+      return undefined;
+    }
+  }
+  async function run(label: string, params: Parameters<typeof simulateContract>[1], describe: (r: TransactionReceipt) => Outcome, opts?: RunOpts) {
     let hash: Hex | undefined;
     try {
       setTx({ phase: "simulating", label });
       const { request } = await simulateContract(config, { ...params, chainId: d.chain.id } as never);
+      const stop = opts?.guard?.();
+      if (stop) {
+        setTx({ phase: "failed", message: stop });
+        return;
+      }
       setTx({ phase: "wallet", label });
       hash = await writeContract(config, request as never);
       setTx({ phase: "pending", label, hash });
-      const receipt = await waitForTransactionReceipt(config, { hash, chainId: d.chain.id });
-      await qc.invalidateQueries();
+      // viem's own wait returns a reverted receipt instead of throwing, so a revert is reported from the receipt.
+      const receipt = await getPublicClient(config, { chainId: d.chain.id })!.waitForTransactionReceipt({ hash });
       if (receipt.status !== "success") {
-        setTx({ phase: "failed", hash, message: `The transaction reverted in block ${receipt.blockNumber}. Nothing changed.` });
+        refresh();
+        const msg = (await override(opts, undefined, true)) ?? `The transaction reverted in block ${receipt.blockNumber}. Nothing changed.`;
+        setTx({ phase: "failed", hash, message: msg });
         return;
       }
-      setTx({ phase: "done", hash, message: await describe(receipt) });
+      let out: Outcome;
+      try {
+        out = describe(receipt);
+      } catch {
+        out = { message: `Confirmed in block ${receipt.blockNumber}.` };
+      }
+      const h = hash;
+      setTx({ phase: "done", hash: h, message: out.message });
+      refresh();
+      if (out.detail) {
+        let more: string;
+        try {
+          more = await out.detail();
+        } catch {
+          more = out.detailFailed ?? BALANCE_UNAVAILABLE;
+        }
+        setTx((t) => (t.phase === "done" && t.hash === h ? { ...t, message: `${out.message} ${more}` } : t));
+      }
     } catch (e) {
       const ex = explainError(e);
-      onRevertName?.(ex.name);
-      if (ex.name === "AlreadyClaimed" || ex.name === "UnknownGift") await qc.invalidateQueries();
-      setTx({ phase: "failed", hash, message: ex.text });
+      if (hash || ex.name === "AlreadyClaimed" || ex.name === "UnknownGift") refresh();
+      const msg = (await override(opts, ex.name, false)) ?? ex.text;
+      setTx({ phase: "failed", hash, message: msg });
     }
   }
-  return { tx, busy, run, reset: () => setTx({ phase: "idle" }) };
+  return {
+    tx,
+    busy,
+    run,
+    /** Clears finished feedback only. A request in flight keeps its status, link and busy flag. */
+    resetTerminal: () => setTx((t) => (t.phase === "done" || t.phase === "failed" ? { phase: "idle" } : t)),
+  };
 }
 
 function TxStatus({ tx, d }: { tx: Tx; d: Deployment }) {
@@ -108,14 +151,29 @@ function useReads(d: Deployment, account?: Address) {
   return { client, summary, acct };
 }
 
+const TABS = [
+  ["donate", "Donate"],
+  ["buy", "Buy with ETH"],
+] as const;
+type TabId = (typeof TABS)[number][0];
+
 export function App({ d }: { d: Deployment }) {
   const { address, isConnected, chainId, connector } = useAccount();
   const [sheet, setSheet] = useState(false);
-  const [tab, setTab] = useState<"donate" | "buy">("donate");
+  const [tab, setTab] = useState<TabId>("donate");
   const reads = useReads(d, address);
   const wrongChain = isConnected && chainId !== d.chain.id;
   const a = reads.acct.data;
   const s = reads.summary.data;
+  const onTabKey = (e: KeyboardEvent<HTMLDivElement>) => {
+    if (e.key !== "ArrowLeft" && e.key !== "ArrowRight" && e.key !== "Home" && e.key !== "End") return;
+    e.preventDefault();
+    const i = TABS.findIndex(([id]) => id === tab);
+    const n = e.key === "Home" ? 0 : e.key === "End" ? TABS.length - 1 : (i + (e.key === "ArrowRight" ? 1 : TABS.length - 1)) % TABS.length;
+    const next = TABS[n][0];
+    setTab(next);
+    document.getElementById(`tab-${next}`)?.focus();
+  };
 
   return (
     <>
@@ -151,20 +209,26 @@ export function App({ d }: { d: Deployment }) {
         </dl>
 
         <section className="card action" aria-label="Donate or buy">
-          <div className="tabs" role="tablist" aria-label="Action">
-            <button role="tab" id="tab-donate" aria-selected={tab === "donate"} aria-controls="panel-donate" className="tab" onClick={() => setTab("donate")}>
-              Donate
-            </button>
-            <button role="tab" id="tab-buy" aria-selected={tab === "buy"} aria-controls="panel-buy" className="tab" onClick={() => setTab("buy")}>
-              Buy with ETH
-            </button>
+          <div className="tabs" role="tablist" aria-label="Action" onKeyDown={onTabKey}>
+            {TABS.map(([id, name]) => (
+              <button
+                key={id}
+                role="tab"
+                id={`tab-${id}`}
+                aria-selected={tab === id}
+                aria-controls={`panel-${id}`}
+                tabIndex={tab === id ? 0 : -1}
+                className="tab"
+                onClick={() => setTab(id)}
+              >
+                {name}
+              </button>
+            ))}
           </div>
           {wrongChain && connector && <WrongChain d={d} onSwitch={() => switchToChain(connector, d)} />}
-          {tab === "donate" ? (
-            <Donate d={d} reads={reads} wrongChain={wrongChain} openConnect={() => setSheet(true)} />
-          ) : (
-            <Buy d={d} reads={reads} wrongChain={wrongChain} openConnect={() => setSheet(true)} />
-          )}
+          {/* Both panels stay mounted so a pending transaction keeps its status and busy state across tab switches. */}
+          <Donate d={d} reads={reads} wrongChain={wrongChain} openConnect={() => setSheet(true)} active={tab === "donate"} />
+          <Buy d={d} reads={reads} wrongChain={wrongChain} openConnect={() => setSheet(true)} active={tab === "buy"} />
         </section>
 
         <Gifts d={d} reads={reads} wrongChain={wrongChain} openConnect={() => setSheet(true)} />
@@ -194,9 +258,9 @@ function WrongChain({ d, onSwitch }: { d: Deployment; onSwitch: () => Promise<vo
 }
 
 type Reads = ReturnType<typeof useReads>;
-type PanelProps = { d: Deployment; reads: Reads; wrongChain: boolean; openConnect: () => void };
+type PanelProps = { d: Deployment; reads: Reads; wrongChain: boolean; openConnect: () => void; active?: boolean };
 
-function Donate({ d, reads, wrongChain, openConnect }: PanelProps) {
+function Donate({ d, reads, wrongChain, openConnect, active = true }: PanelProps) {
   const { address, isConnected } = useAccount();
   const [text, setText] = useState("");
   const amount = parseAmount(text);
@@ -210,37 +274,53 @@ function Donate({ d, reads, wrongChain, openConnect }: PanelProps) {
   const ready = isConnected && !wrongChain && amount !== undefined && !short_ && !!a;
   const latest = donateTx.tx.phase !== "idle" ? donateTx.tx : approveTx.tx;
 
-  const approve = () =>
+  const approve = () => {
+    const owner = address!;
     approveTx.run(
       "the approval",
-      { address: d.token.address, abi: d.token.abi, functionName: "approve", args: [d.vault.address, amount!], account: address } as never,
-      async () => {
-        const allowance = (await reads.client.readContract({ address: d.token.address, abi: d.token.abi as Abi, functionName: "allowance", args: [address!, d.vault.address] })) as bigint;
-        return `Approved. The vault may now take ${fmt(allowance)} testAdam from your wallet.`;
+      { address: d.token.address, abi: d.token.abi, functionName: "approve", args: [d.vault.address, amount!], account: owner } as never,
+      (r) => {
+        const ev = (parseEventLogs({ abi: d.token.abi as Abi, logs: r.logs, eventName: "Approval" }) as unknown as { address: string; args: { owner: string; value: bigint } }[]).find(
+          (l) => l.address.toLowerCase() === d.token.address.toLowerCase() && l.args.owner.toLowerCase() === owner.toLowerCase(),
+        );
+        return {
+          message: ev ? `Approved ${fmt(ev.args.value)} testAdam for the vault in block ${r.blockNumber}.` : `Confirmed in block ${r.blockNumber}, but it logged no approval.`,
+          detail: async () => {
+            const allowance = (await reads.client.readContract({ address: d.token.address, abi: d.token.abi as Abi, functionName: "allowance", args: [owner, d.vault.address] })) as bigint;
+            return `The vault may now take ${fmt(allowance)} testAdam from your wallet.`;
+          },
+          detailFailed: "Allowance unavailable. Refresh to try again.",
+        };
       },
     );
-  const donate = () =>
+  };
+  const donate = () => {
+    const donor = address!;
     donateTx.run(
       "the donation",
-      { address: d.vault.address, abi: d.vault.abi, functionName: "donate", args: [amount!], account: address } as never,
-      async (r) => {
-        const ev = parseEventLogs({ abi: d.vault.abi as Abi, logs: r.logs, eventName: "Donated" })[0] as unknown as
-          | { args: { giftId: bigint; amount: bigint } }
-          | undefined;
-        const pts = (await reads.client.readContract({ address: d.vault.address, abi: d.vault.abi as Abi, functionName: "points", args: [address!] })) as bigint;
-        if (!ev) return `The transaction succeeded but recorded no gift. Your points are ${fmt(pts)}.`;
-        setText("");
-        return `Gift #${ev.args.giftId} recorded: ${fmt(ev.args.amount)} testAdam. Your points are now ${fmt(pts)}.`;
+      { address: d.vault.address, abi: d.vault.abi, functionName: "donate", args: [amount!], account: donor } as never,
+      (r) => {
+        const ev = parseEventLogs({ abi: d.vault.abi as Abi, logs: r.logs, eventName: "Donated" })[0] as unknown as { args: { giftId: bigint; amount: bigint } } | undefined;
+        if (ev) setText("");
+        return {
+          message: ev ? `Gift #${ev.args.giftId} recorded: ${fmt(ev.args.amount)} testAdam.` : `Confirmed in block ${r.blockNumber}, but it recorded no gift.`,
+          detail: async () => {
+            const pts = (await reads.client.readContract({ address: d.vault.address, abi: d.vault.abi as Abi, functionName: "points", args: [donor], blockNumber: r.blockNumber })) as bigint;
+            return `Your points are now ${fmt(pts)}.`;
+          },
+          detailFailed: "Points unavailable. Refresh to try again.",
+        };
       },
     );
+  };
 
   return (
-    <div className="panel" role="tabpanel" id="panel-donate" aria-labelledby="tab-donate">
+    <div className="panel" role="tabpanel" id="panel-donate" aria-labelledby="tab-donate" hidden={!active}>
       <div className="field">
         <div className="field-label">
           <label htmlFor="donate-amount">Amount to give</label>
           {a && (
-            <button type="button" className="link-btn" onClick={() => setText(fmtPlain(a.balance))} disabled={a.balance === 0n} aria-label={`Use full balance, ${fmt(a.balance)} testAdam`}>
+            <button type="button" className="link-btn" onClick={() => setText(fmtInput(a.balance))} disabled={a.balance === 0n} aria-label={`Use full balance, ${fmt(a.balance)} testAdam`}>
               Balance {fmt(a.balance)}
             </button>
           )}
@@ -250,12 +330,12 @@ function Donate({ d, reads, wrongChain, openConnect }: PanelProps) {
             id="donate-amount"
             inputMode="decimal"
             autoComplete="off"
-            placeholder="1.5"
+            placeholder={example("1.5")}
             value={text}
             onChange={(e) => {
               setText(e.target.value);
-              approveTx.reset();
-              donateTx.reset();
+              approveTx.resetTerminal();
+              donateTx.resetTerminal();
             }}
             aria-invalid={invalid || !!short_}
             aria-describedby="donate-help"
@@ -265,10 +345,10 @@ function Donate({ d, reads, wrongChain, openConnect }: PanelProps) {
       </div>
       <p id="donate-help" className={`hint ${invalid || short_ ? "hint-error" : ""}`}>
         {invalid
-          ? "Use a number with at most 18 decimals, like 1.5."
+          ? `Enter a positive amount with at most 18 decimals, like ${example("1.5")}.`
           : short_
             ? `You have ${fmt(a!.balance)} testAdam. Enter that much or less.`
-            : "Only Donate creates a gift and earns points: one per whole testAdam, fractions count, kept after payout."}
+            : "Only Donate creates a gift. You earn one nontransferable point per testAdam the vault receives, including fractions, and keep those points after payout."}
       </p>
       {!isConnected ? (
         <button className="btn btn-primary btn-wide" onClick={openConnect}>
@@ -292,7 +372,7 @@ function Donate({ d, reads, wrongChain, openConnect }: PanelProps) {
           public: the first wallet other than the donor address to claim receives the full gift.
         </p>
         <p>
-          Points count gross donations and stay after payout. A donor can farm them by reclaiming gifts with a second wallet. Points are not proof of net giving
+          Points cannot be transferred. They count gross donations and stay after payout. A donor can farm them by reclaiming gifts with a second wallet. Points are not proof of net giving
           and must not be used for allocations or rewards.
         </p>
       </details>
@@ -300,15 +380,12 @@ function Donate({ d, reads, wrongChain, openConnect }: PanelProps) {
   );
 }
 
-function fmtPlain(v: bigint) {
-  return fmt(v, 18, 18).replace(/,/g, "");
-}
-
-function Buy({ d, reads, wrongChain, openConnect }: PanelProps) {
+function Buy({ d, reads, wrongChain, openConnect, active = true }: PanelProps) {
   const { address, isConnected, chainId } = useAccount();
-  const [text, setText] = useState("0.01");
+  const [text, setText] = useState(() => example("0.01"));
   const [slippage, setSlippage] = useState(100); // bps
   const [expiry, setExpiry] = useState(10); // minutes
+  const [deadline, setDeadline] = useState<bigint>();
   const [now, setNow] = useState(Date.now());
   const amount = parseAmount(text, d.network.nativeCurrency.decimals);
   const k = d.poolKey;
@@ -324,7 +401,7 @@ function Buy({ d, reads, wrongChain, openConnect }: PanelProps) {
 
   const quote = useQuery({
     queryKey: ["quote", amount?.toString(), address, chainId],
-    enabled: amount !== undefined,
+    enabled: active && amount !== undefined,
     retry: false,
     queryFn: async () => {
       const { result } = await reads.client.simulateContract({
@@ -336,29 +413,47 @@ function Buy({ d, reads, wrongChain, openConnect }: PanelProps) {
       return { out: result[0], at: Date.now() };
     },
   });
-  const expired = quote.data ? now - quote.data.at > QUOTE_TTL_MS : false;
-  const left = quote.data ? Math.max(0, Math.ceil((QUOTE_TTL_MS - (now - quote.data.at)) / 1000)) : 0;
-  const min = quote.data ? minOut(quote.data.out, slippage) : undefined;
+  const positive = !!quote.data && quote.data.out > 0n && !quote.isError;
+  const expired = positive ? now - quote.data!.at > QUOTE_TTL_MS : false;
+  const left = positive ? Math.max(0, Math.ceil((QUOTE_TTL_MS - (now - quote.data!.at)) / 1000)) : 0;
+  const min = positive ? minOut(quote.data!.out, slippage) : undefined;
   const ethBal = reads.acct.data?.eth;
   const tooMuch = ethBal !== undefined && amount !== undefined && ethBal < amount;
   const invalid = text.trim() !== "" && amount === undefined;
-  const quoteErr = quote.error ? explainError(quote.error) : undefined;
-  const noLiquidity = quote.isError;
+  const quoteErr = quote.isError ? explainError(quote.error) : undefined;
+  const noLiquidity = quote.isError && isLiquidityError(quote.error);
 
   const buy = () => {
-    const deadline = BigInt(Math.floor(Date.now() / 1000) + expiry * 60);
-    const { commands, inputs } = encodeExactInSingle({ poolKey: k, zeroForOne, amountIn: amount!, amountOutMinimum: min!, deadline, extended: uni.extendedSwapParams === true });
-    const before = reads.acct.data?.balance ?? 0n;
+    const quotedAt = quote.data!.at;
+    if (Date.now() - quotedAt > QUOTE_TTL_MS) return;
+    const amt = amount!;
+    const buyer = address!;
+    const dl = BigInt(Math.floor(Date.now() / 1000) + expiry * 60);
+    setDeadline(dl);
+    const { commands, inputs } = encodeExactInSingle({ poolKey: k, zeroForOne, amountIn: amt, amountOutMinimum: min!, deadline: dl, extended: uni.extendedSwapParams === true });
+    const before = reads.acct.data?.balance;
     swapTx.run(
       "the buy",
-      { address: uni.universalRouter, abi: universalRouterAbi, functionName: "execute", args: [commands, inputs, deadline], value: amount!, account: address } as never,
-      async (r) => {
+      { address: uni.universalRouter, abi: universalRouterAbi, functionName: "execute", args: [commands, inputs, dl], value: amt, account: buyer } as never,
+      (r) => {
         const logs = parseEventLogs({ abi: d.token.abi as Abi, logs: r.logs, eventName: "Transfer" }) as unknown as { address: string; args: { to: string; value: bigint } }[];
         const got = logs
-          .filter((l) => l.address.toLowerCase() === d.token.address.toLowerCase() && l.args.to.toLowerCase() === address!.toLowerCase())
+          .filter((l) => l.address.toLowerCase() === d.token.address.toLowerCase() && l.args.to.toLowerCase() === buyer.toLowerCase())
           .reduce((x, l) => x + l.args.value, 0n);
-        const after = (await reads.client.readContract({ address: d.token.address, abi: d.token.abi as Abi, functionName: "balanceOf", args: [address!], blockNumber: r.blockNumber })) as bigint;
-        return `Bought ${fmt(got)} testAdam for ${fmt(amount!)} ETH in block ${r.blockNumber}. Balance ${fmt(before)} → ${fmt(after)} testAdam.`;
+        return {
+          message:
+            got > 0n
+              ? `Bought ${fmt(got)} testAdam for ${fmt(amt)} ETH in block ${r.blockNumber}.`
+              : `Confirmed in block ${r.blockNumber}, but no testAdam reached your wallet.`,
+          detail: async () => {
+            const after = (await reads.client.readContract({ address: d.token.address, abi: d.token.abi as Abi, functionName: "balanceOf", args: [buyer], blockNumber: r.blockNumber })) as bigint;
+            return before !== undefined ? `Balance ${fmt(before)} → ${fmt(after)} testAdam.` : `Balance ${fmt(after)} testAdam.`;
+          },
+        };
+      },
+      {
+        // The simulation can take long enough for the quote to expire; hold the wallet request if it did.
+        guard: () => (Date.now() - quotedAt > QUOTE_TTL_MS ? "Quote expired. Refresh quote, then choose Buy again. Nothing was sent." : undefined),
       },
     );
   };
@@ -370,6 +465,12 @@ function Buy({ d, reads, wrongChain, openConnect }: PanelProps) {
         Connect a wallet to buy
       </button>
     );
+  else if (swapTx.busy)
+    action = (
+      <button className="btn btn-primary btn-wide" disabled>
+        Buying…
+      </button>
+    );
   else if (expired)
     action = (
       <button className="btn btn-secondary btn-wide" onClick={() => quote.refetch()} disabled={quote.isFetching}>
@@ -378,17 +479,13 @@ function Buy({ d, reads, wrongChain, openConnect }: PanelProps) {
     );
   else
     action = (
-      <button
-        className="btn btn-primary btn-wide"
-        disabled={wrongChain || !quote.data || quote.isFetching || tooMuch || swapTx.busy || !min || min === 0n}
-        onClick={buy}
-      >
-        {swapTx.busy ? "Buying…" : "Buy testAdam"}
+      <button className="btn btn-primary btn-wide" disabled={wrongChain || !positive || quote.isFetching || tooMuch || !min || min === 0n} onClick={buy}>
+        Buy testAdam
       </button>
     );
 
   return (
-    <div className="panel" role="tabpanel" id="panel-buy" aria-labelledby="tab-buy">
+    <div className="panel" role="tabpanel" id="panel-buy" aria-labelledby="tab-buy" hidden={!active}>
       <div className="field">
         <div className="field-label">
           <label htmlFor="buy-amount">ETH to spend</label>
@@ -399,11 +496,11 @@ function Buy({ d, reads, wrongChain, openConnect }: PanelProps) {
             id="buy-amount"
             inputMode="decimal"
             autoComplete="off"
-            placeholder="0.01"
+            placeholder={example("0.01")}
             value={text}
             onChange={(e) => {
               setText(e.target.value);
-              swapTx.reset();
+              swapTx.resetTerminal();
             }}
             aria-invalid={invalid || tooMuch}
             aria-describedby="buy-quote"
@@ -422,7 +519,7 @@ function Buy({ d, reads, wrongChain, openConnect }: PanelProps) {
           </select>
         </label>
         <label className="field">
-          <span className="field-label">Expires after</span>
+          <span className="field-label">Transaction deadline</span>
           <select value={expiry} onChange={(e) => setExpiry(Number(e.target.value))}>
             <option value={5}>5 min</option>
             <option value={10}>10 min</option>
@@ -432,15 +529,22 @@ function Buy({ d, reads, wrongChain, openConnect }: PanelProps) {
       </div>
       <div id="buy-quote" className="quote" aria-live="polite">
         {invalid ? (
-          <p className="hint hint-error">Use a number with at most 18 decimals, like 0.01.</p>
+          <p className="hint hint-error">Enter a positive amount with at most 18 decimals, like {example("0.01")}.</p>
         ) : amount === undefined ? (
           <p className="hint">Enter how much ETH to spend.</p>
-        ) : quote.isFetching && !quote.data ? (
+        ) : quote.isFetching && !quote.data && !quote.isError ? (
           <p className="hint">Getting a quote from the Uniswap v4 quoter…</p>
         ) : noLiquidity ? (
-          <p className="hint hint-error">
-            No quote: {quoteErr?.text}. The pool may not have enough liquidity for this amount. Try a smaller amount.
-          </p>
+          <p className="hint hint-error">Insufficient liquidity for this amount. Enter less.</p>
+        ) : quote.isError ? (
+          <div className="retry">
+            <p className="hint hint-error">Quote unavailable: {quoteErr?.text}</p>
+            <button type="button" className="btn btn-secondary btn-sm" onClick={() => quote.refetch()} disabled={quote.isFetching}>
+              {quote.isFetching ? "Retrying…" : "Retry quote"}
+            </button>
+          </div>
+        ) : quote.data && quote.data.out === 0n ? (
+          <p className="hint hint-error">This amount buys 0 testAdam. Enter a larger amount.</p>
         ) : quote.data && min !== undefined ? (
           <dl className="kv">
             <div>
@@ -463,7 +567,10 @@ function Buy({ d, reads, wrongChain, openConnect }: PanelProps) {
             </div>
             <div>
               <dt>Deadline</dt>
-              <dd>Reverts if not mined {expiry} min after you sign</dd>
+              <dd>
+                Deadline starts when you click Buy.
+                {deadline !== undefined && <span className="muted"> Last buy: reverts if not mined by {utc(deadline)}.</span>}
+              </dd>
             </div>
           </dl>
         ) : null}
@@ -490,6 +597,9 @@ function Gifts({ d, reads, wrongChain, openConnect }: PanelProps) {
   const gifts = useQuery({
     queryKey: ["gifts", count?.toString(), pages],
     enabled: count !== undefined,
+    // Same cycle as the summary: another wallet's claim leaves giftCount unchanged, so rows are reread on their own.
+    refetchInterval: 20_000,
+    placeholderData: keepPreviousData,
     queryFn: async (): Promise<Gift[]> => {
       const n = Number(count!);
       const ids: bigint[] = [];
@@ -524,15 +634,34 @@ function Gifts({ d, reads, wrongChain, openConnect }: PanelProps) {
         <p className="note note-error">Gifts could not be read from the vault. Check your connection; the page retries every 20 seconds.</p>
       ) : count === 0n ? (
         <p className="empty">No gifts yet. Donate above to create the first one.</p>
-      ) : gifts.isLoading || count === undefined ? (
+      ) : gifts.isError && !gifts.data ? (
+        <div className="retry">
+          <p className="note note-error">Gift details couldn&rsquo;t be loaded.</p>
+          <button className="btn btn-secondary btn-sm" onClick={() => gifts.refetch()} disabled={gifts.isFetching}>
+            {gifts.isFetching ? "Retrying…" : "Retry gifts"}
+          </button>
+        </div>
+      ) : gifts.isLoading || count === undefined || !gifts.data ? (
         <p className="hint">Loading gifts…</p>
       ) : (
-        <ul className="gifts">
-          {list.map((g) => (
-            <GiftRow key={g.id.toString()} g={g} d={d} me={address} canSend={isConnected && !wrongChain} openConnect={openConnect} isConnected={isConnected} reads={reads} />
-          ))}
-          {list.length === 0 && <li className="empty">No open gifts among those shown.</li>}
-        </ul>
+        <>
+          {gifts.isError && (
+            <div className="retry">
+              <p className="note note-error">
+                Gift details didn&rsquo;t refresh. Claim status last checked at {new Date(gifts.dataUpdatedAt).toISOString().slice(11, 19)} UTC.
+              </p>
+              <button className="btn btn-secondary btn-sm" onClick={() => gifts.refetch()} disabled={gifts.isFetching}>
+                {gifts.isFetching ? "Retrying…" : "Retry gifts"}
+              </button>
+            </div>
+          )}
+          <ul className="gifts">
+            {list.map((g) => (
+              <GiftRow key={g.id.toString()} g={g} d={d} me={address} canSend={isConnected && !wrongChain} openConnect={openConnect} isConnected={isConnected} reads={reads} />
+            ))}
+            {list.length === 0 && <li className="empty">No open gifts among those shown.</li>}
+          </ul>
+        </>
       )}
       {count !== undefined && gifts.data && BigInt(gifts.data.length) < count && (
         <button className="btn btn-secondary" onClick={() => setPages(pages + 1)}>
@@ -546,12 +675,30 @@ function Gifts({ d, reads, wrongChain, openConnect }: PanelProps) {
 function GiftRow({ g, d, me, canSend, isConnected, openConnect, reads }: { g: Gift; d: Deployment; me?: Address; canSend: boolean; isConnected: boolean; openConnect: () => void; reads: Reads }) {
   const claimTx = useTx(d);
   const mine = !!me && me.toLowerCase() === g.donor.toLowerCase();
-  const claim = () =>
-    claimTx.run("the claim", { address: d.vault.address, abi: d.vault.abi, functionName: "claim", args: [g.id], account: me } as never, async (r) => {
-      const ev = parseEventLogs({ abi: d.vault.abi as Abi, logs: r.logs, eventName: "Claimed" })[0] as unknown as { args: { amount: bigint } } | undefined;
-      const bal = (await reads.client.readContract({ address: d.token.address, abi: d.token.abi as Abi, functionName: "balanceOf", args: [me!], blockNumber: r.blockNumber })) as bigint;
-      return ev ? `You received ${fmt(ev.args.amount)} testAdam from gift #${g.id}. Balance now ${fmt(bal)}.` : `The claim succeeded but emitted no payout. Balance ${fmt(bal)}.`;
-    });
+  const claim = () => {
+    const claimer = me!;
+    claimTx.run(
+      "the claim",
+      { address: d.vault.address, abi: d.vault.abi, functionName: "claim", args: [g.id], account: claimer } as never,
+      (r) => {
+        const ev = parseEventLogs({ abi: d.vault.abi as Abi, logs: r.logs, eventName: "Claimed" })[0] as unknown as { args: { amount: bigint } } | undefined;
+        return {
+          message: ev ? `You received ${fmt(ev.args.amount)} testAdam from gift #${g.id}.` : `Confirmed in block ${r.blockNumber}, but it paid out nothing.`,
+          detail: async () => {
+            const bal = (await reads.client.readContract({ address: d.token.address, abi: d.token.abi as Abi, functionName: "balanceOf", args: [claimer], blockNumber: r.blockNumber })) as bigint;
+            return `Balance now ${fmt(bal)} testAdam.`;
+          },
+        };
+      },
+      {
+        // A failed preflight or a mined revert: reread this gift. If it is claimed now, another wallet won it.
+        afterFail: async () => {
+          const [, , claimed] = (await reads.client.readContract({ address: d.vault.address, abi: d.vault.abi as Abi, functionName: "getGift", args: [g.id] })) as [Address, bigint, boolean];
+          return claimed ? "Another wallet claimed this gift first." : undefined;
+        },
+      },
+    );
+  };
   return (
     <li className="gift">
       <div className="gift-main">
@@ -619,7 +766,21 @@ function PoolPanel({ d }: { d: Deployment }) {
           </div>
           <div>
             <dt>Fully diluted value</dt>
-            <dd>{p.sqrtPriceX96 === 0n ? "Unavailable without a price" : `${fmt(p.fdvWei, 18, 4)} ETH`} <span className="muted">from totalSupply {fmt(p.totalSupply, 18, 0)}</span></dd>
+            <dd>
+              {p.totalSupply === undefined ? (
+                <>
+                  Unavailable. <span className="muted">The token has no code at this block, so it has no supply yet.</span>
+                </>
+              ) : p.sqrtPriceX96 === 0n ? (
+                <>
+                  Unavailable without a price <span className="muted">(totalSupply {fmt(p.totalSupply, 18, 0)})</span>
+                </>
+              ) : (
+                <>
+                  {fmt(p.fdvWei, 18, 4)} ETH <span className="muted">from totalSupply {fmt(p.totalSupply, 18, 0)}</span>
+                </>
+              )}
+            </dd>
           </div>
           <div>
             <dt>Circulating market cap</dt>
@@ -635,7 +796,7 @@ function PoolPanel({ d }: { d: Deployment }) {
                   {fmt(p.volume.wei, 18, 6)} ETH <span className="muted">({p.volume.swaps} swaps, ETH leg)</span>
                 </>
               ) : (
-                <>Unavailable: partial scan.</>
+                <>{p.volume.headline ?? "Unavailable: partial scan."}</>
               )}
             </dd>
           </div>

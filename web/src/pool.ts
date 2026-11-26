@@ -13,15 +13,16 @@ export type PoolSnapshot = {
   timestamp: bigint;
   sqrtPriceX96: bigint;
   liquidity: bigint;
-  totalSupply: bigint;
+  /** Undefined when the token has no code at this block (a finalized block before launch). */
+  totalSupply?: bigint;
   /** ETH per whole testAdam, scaled 1e18; 0 when the pool is not initialized at this block. */
   ethPerToken: bigint;
-  /** FDV in wei: totalSupply * ethPerToken. */
-  fdvWei: bigint;
+  /** FDV in wei: totalSupply * ethPerToken. Undefined without a supply. */
+  fdvWei?: bigint;
   initBlock?: bigint;
   volume:
     | { status: "complete"; wei: bigint; swaps: number; fromBlock: bigint; toBlock: bigint; fromTime: bigint; note?: string }
-    | { status: "partial"; fromBlock: bigint; toBlock: bigint; scannedTo?: bigint; reason: string };
+    | { status: "partial"; fromBlock: bigint; toBlock: bigint; scannedTo?: bigint; reason: string; headline?: string };
 };
 
 /** Sum |amount0| (or |amount1|) of distinct Swap logs. */
@@ -65,40 +66,69 @@ export async function loadPool(client: PublicClient, d: Deployment): Promise<Poo
   const pm = d.network.uniswapV4.poolManager;
   const fin = await client.getBlock({ blockTag: "finalized" });
   const block = fin.number!;
+  const tokenCode = await client.getCode({ address: d.token.address, blockNumber: block });
+  const tokenLive = !!tokenCode && tokenCode !== "0x";
   const [slot0, liquidity, totalSupply] = await Promise.all([
     client.readContract({ address: sv, abi: stateViewAbi, functionName: "getSlot0", args: [poolId], blockNumber: block }),
     client.readContract({ address: sv, abi: stateViewAbi, functionName: "getLiquidity", args: [poolId], blockNumber: block }),
-    client.readContract({ address: d.token.address, abi: d.token.abi as Abi, functionName: "totalSupply", blockNumber: block }) as Promise<bigint>,
+    tokenLive
+      ? (client.readContract({ address: d.token.address, abi: d.token.abi as Abi, functionName: "totalSupply", blockNumber: block }) as Promise<bigint>)
+      : Promise.resolve(undefined),
   ]);
   const sqrtPriceX96 = slot0[0];
   const tokenIsCurrency1 = k.currency1.toLowerCase() === d.token.address.toLowerCase();
   const ethIsCurrency0 = k.currency0 === "0x0000000000000000000000000000000000000000";
   // ETH per testAdam: base = testAdam. Both 18 decimals here, but the formula keeps them explicit.
   const ethPerToken = priceFromSqrt(sqrtPriceX96, { baseIsCurrency0: !tokenIsCurrency1, dec0: 18, dec1: 18 });
-  const fdvWei = (totalSupply * ethPerToken) / 10n ** 18n;
+  const fdvWei = totalSupply === undefined ? undefined : (totalSupply * ethPerToken) / 10n ** 18n;
+  const base = { poolId, block, timestamp: fin.timestamp, sqrtPriceX96, liquidity, totalSupply, ethPerToken, fdvWei };
+  const cutoff0 = fin.timestamp - DAY;
 
-  // Initialization block: the first Initialize log for this pool id at or after the contracts' deployment.
+  // StateView proves the pool is uninitialized at this block. A pool cannot be uninitialized later, so no
+  // swap can have happened at or before it: the window ending here is verified empty.
+  if (sqrtPriceX96 === 0n)
+    return {
+      ...base,
+      volume: {
+        status: "complete",
+        wei: 0n,
+        swaps: 0,
+        fromBlock: block,
+        toBlock: block,
+        fromTime: cutoff0,
+        note: `StateView reports the pool uninitialized at block ${block}${tokenLive ? "" : ", before the token was deployed"}, so the window ending there holds no swaps.`,
+      },
+    };
+
+  // The pool is initialized: the scan must start at a verified Initialize log for this pool id.
   let initBlock: bigint | undefined;
   let initError: string | undefined;
   try {
-    const latest = await client.getBlockNumber();
-    const tokenBlock = await firstCodeBlock(client, d.token.address, latest);
-    for (let from = tokenBlock; from <= latest && initBlock === undefined; from += CHUNK) {
-      const to = from + CHUNK - 1n > latest ? latest : from + CHUNK - 1n;
+    const tokenBlock = await firstCodeBlock(client, d.token.address, block);
+    for (let from = tokenBlock; from <= block && initBlock === undefined; from += CHUNK) {
+      const to = from + CHUNK - 1n > block ? block : from + CHUNK - 1n;
       const logs = await getLogsRetry(() => client.getLogs({ address: pm, event: initializeEvent, args: { id: poolId }, fromBlock: from, toBlock: to }));
       if (logs.length) initBlock = logs[0].blockNumber!;
     }
   } catch (e) {
-    initError = `The pool's initialization block could not be read (${(e as Error).message.slice(0, 80)}).`;
+    initError = `The Initialize search did not complete (${(e as Error).message.slice(0, 80)}).`;
   }
-  const base = { poolId, block, timestamp: fin.timestamp, sqrtPriceX96, liquidity, totalSupply, ethPerToken, fdvWei, initBlock };
-  if (initError) return { ...base, volume: { status: "partial", fromBlock: block, toBlock: block, reason: initError } };
+  if (initBlock === undefined || initBlock > block)
+    return {
+      ...base,
+      initBlock,
+      volume: {
+        status: "partial",
+        fromBlock: block,
+        toBlock: block,
+        headline: "Volume unavailable. The pool initialization block could not be verified.",
+        reason: initError ?? `StateView shows the pool initialized at block ${block}, but no Initialize log for this pool id was found up to that block.`,
+      },
+    };
 
-  const cutoff = fin.timestamp - DAY;
+  const cutoff = cutoff0;
   let volume: PoolSnapshot["volume"];
-  if (initBlock === undefined || initBlock > block) {
-    volume = { status: "complete", wei: 0n, swaps: 0, fromBlock: block, toBlock: block, fromTime: cutoff, note: initBlock ? `The pool was initialized at block ${initBlock}, after this finalized block, so the window holds no swaps.` : "No Initialize event found for this pool id, so it has no swaps." };
-  } else {
+  {
     let from: bigint;
     try {
       const cutBlock = await firstBlockAtOrAfter(client, cutoff, block);

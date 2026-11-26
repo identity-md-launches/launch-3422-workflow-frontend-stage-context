@@ -32,6 +32,8 @@ export const quoterAbi = [
       { name: "gasEstimate", type: "uint256" },
     ],
   },
+  { type: "error", name: "NotEnoughLiquidity", inputs: [{ name: "poolId", type: "bytes32" }] },
+  { type: "error", name: "UnexpectedRevertBytes", inputs: [{ name: "revertData", type: "bytes" }] },
 ] as const;
 
 export const stateViewAbi = parseAbi([

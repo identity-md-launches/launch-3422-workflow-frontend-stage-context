@@ -529,6 +529,11 @@ select {
   padding: var(--space-3) 0;
 }
 
+/* A display rule on a class would otherwise override the hidden attribute (inactive tab panel). */
+[hidden] {
+  display: none !important;
+}
+
 /* Connect sheet */
 .sheet-bg {
   position: fixed;
@@ -547,14 +552,37 @@ select {
   border-radius: var(--radius) var(--radius) 0 0;
   padding: var(--space-4);
   padding-bottom: calc(var(--space-4) + env(safe-area-inset-bottom));
-  display: grid;
-  gap: var(--space-1);
+  /* Never taller than the viewport: the title and Close stay put and the wallet rows scroll. */
+  max-height: 100vh;
+  max-height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
 }
 .sheet-head {
   display: flex;
+  flex: none;
   justify-content: space-between;
   align-items: center;
   margin-bottom: var(--space-2);
+}
+.sheet-rows {
+  display: grid;
+  gap: var(--space-1);
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.retry {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+.retry .note,
+.retry .hint {
+  flex: 1 1 12rem;
+  min-width: 0;
 }
 .x {
   width: 32px;
@@ -618,6 +646,8 @@ select {
   }
   .sheet {
     border-radius: var(--radius);
+    max-height: calc(100vh - 2 * var(--space-4));
+    max-height: calc(100dvh - 2 * var(--space-4));
   }
 }
 @media (min-width: 860px) {
